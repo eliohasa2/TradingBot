@@ -1,0 +1,602 @@
+//+------------------------------------------------------------------+
+//|                                 DarkCloud PiercingLine Stoch.mq5 |
+//|                                  Copyright 2024, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2024, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
+#property version   "1.01"
+
+#include <Trade\Trade.mqh>
+#include <Trade\SymbolInfo.mqh>
+
+#define SIGNAL_BUY    1             // Buy signal
+#define SIGNAL_NOT    0             // No trading signal
+#define SIGNAL_SELL  -1             // Sell signal
+
+#define CLOSE_LONG    2             // Signal to close Long
+#define CLOSE_SHORT  -2             // Signal to close Short
+
+//--- Input parameters
+input int InpAverBodyPeriod=12;     // Period for calculating average candlestick size
+input int InpMAPeriod      =5;      // Trend MA period
+input int InpStochK        =47;     // Period %K
+input int InpStochD        =9;      // Period %D
+input int InpStochSlow     =13;     // Smoothing period %K
+input ENUM_STO_PRICE InpStochApplied=STO_LOWHIGH; // Calculation type
+input ENUM_MA_METHOD InpStochMA     =MODE_SMA;    // Smoothing type
+
+//--- Trade parameters
+input uint InpDuration=10;          // Position holding time in bars
+input uint InpSL      =200;         // Stop Loss in points
+input uint InpTP      =200;         // Take Profit in points
+input uint InpSlippage=10;          // Slippage in points
+//--- Money management parameters
+input double InpLot=0.1;            // Lot size
+//--- Expert ID
+input long InpMagicNumber=120800;   // Magic Number
+
+//--- Global variables
+int    ExtAvgBodyPeriod;            // Average candlestick calculation period
+int    ExtSignalOpen     =0;        // Buy/Sell signal
+int    ExtSignalClose    =0;        // Signal to close a position
+string ExtPatternInfo    ="";       // Current pattern information
+string ExtDirection      ="";       // Position opening direction
+bool   ExtPatternDetected=false;    // Pattern detected
+bool   ExtConfirmed      =false;    // Pattern confirmed
+bool   ExtCloseByTime    =true;     // Requires closing by time 
+bool   ExtCheckPassed    =true;     // Status checking error
+//--- Indicator handles
+int    ExtIndicatorHandle=INVALID_HANDLE;
+int    ExtTrendMAHandle=INVALID_HANDLE;
+
+//--- Service objects
+CTrade      ExtTrade;
+CSymbolInfo ExtSymbolInfo;
+
+//--- Expert initialization function
+int OnInit()
+  {
+   Print("InpSL=", InpSL);
+   Print("InpTP=", InpTP);
+//--- Set parameters for trading operations
+   ExtTrade.SetDeviationInPoints(InpSlippage);    // Slippage
+   ExtTrade.SetExpertMagicNumber(InpMagicNumber); // Expert Advisor ID
+   ExtTrade.LogLevel(LOG_LEVEL_ERRORS);           // Logging level
+
+   ExtAvgBodyPeriod=InpAverBodyPeriod;
+//--- Indicator initialization
+   ExtIndicatorHandle=iStochastic(_Symbol, _Period, InpStochK, InpStochD, InpStochSlow, InpStochMA, InpStochApplied);
+   if(ExtIndicatorHandle==INVALID_HANDLE)
+     {
+      Print("Error creating iStochastic indicator");
+      return(INIT_FAILED);
+     }
+
+//--- Trend moving average     
+   ExtTrendMAHandle=iMA(_Symbol, _Period, InpMAPeriod, 0, InpStochMA, PRICE_CLOSE);
+   if(ExtTrendMAHandle==INVALID_HANDLE)
+     {
+      Print("Error creating Moving Average indicator");
+      return(INIT_FAILED);
+     }
+
+//--- OK
+   return(INIT_SUCCEEDED);
+  }
+
+//--- Expert deinitialization function
+void OnDeinit(const int reason)
+  {
+//--- Release indicator handle
+   IndicatorRelease(ExtIndicatorHandle);
+   IndicatorRelease(ExtTrendMAHandle);
+  }
+
+//--- Expert tick function
+void OnTick()
+  {
+//--- Save the next bar start time; all checks at bar opening only
+   static datetime next_bar_open=0;
+
+//--- Phase 1 - Check the emergence of a new bar and update the status
+   if(TimeCurrent()>=next_bar_open)
+     {
+      //--- Get the current state of environment on the new bar
+      // Namely, set the values of global variables:
+      // ExtPatternDetected - pattern detection
+      // ExtConfirmed - pattern confirmation 
+      // ExtSignalOpen - signal to open
+      // ExtSignalClose - signal to close
+      // ExtPatternInfo - current pattern information
+      if(CheckState())
+        {
+         //--- Set the new bar opening time
+         next_bar_open=TimeCurrent();
+         next_bar_open-=next_bar_open%PeriodSeconds(_Period);
+         next_bar_open+=PeriodSeconds(_Period);
+
+         //--- Report the emergence of a new bar only once within a bar
+         if(ExtPatternDetected && ExtConfirmed)
+            Print(ExtPatternInfo);
+        }
+      else
+        {
+         //--- Error getting the status, retry on the next tick
+         return;
+        }
+     }
+
+//--- Phase 2 - If there is a signal and no position in this direction
+   if(ExtSignalOpen && !PositionExist(ExtSignalOpen))
+     {
+      Print("\r\nSignal to open position ", ExtDirection);
+      PositionOpen();
+      if(PositionExist(ExtSignalOpen))
+         ExtSignalOpen=SIGNAL_NOT;
+     }
+
+//--- Phase 3 - Close if there is a signal to close
+   if(ExtSignalClose && PositionExist(ExtSignalClose))
+     {
+      Print("\r\nSignal to close position ", ExtDirection);
+      CloseBySignal(ExtSignalClose);
+      if(!PositionExist(ExtSignalClose))
+         ExtSignalClose=SIGNAL_NOT;
+     }
+
+//--- Phase 4 - Close upon expiration
+   if(ExtCloseByTime && PositionExpiredByTimeExist())
+     {
+      CloseExpiredPositions();
+      ExtCloseByTime=PositionExpiredByTimeExist();
+     }
+  }
+
+//--- Get the current environment and check for a pattern
+bool CheckState()
+  {
+//--- Check if there is a pattern
+   if(!CheckPattern())
+     {
+      Print("Error, failed to check pattern");
+      return(false);
+     }
+
+//--- Check for confirmation
+   if(!CheckConfirmation())
+     {
+      Print("Error, failed to check pattern confirmation");
+      return(false);
+     }
+//--- If there is no confirmation, cancel the signal
+   if(!ExtConfirmed)
+      ExtSignalOpen=SIGNAL_NOT;
+
+//--- Check if there is a signal to close a position
+   if(!CheckCloseSignal())
+     {
+      Print("Error, failed to check the closing signal");
+      return(false);
+     }
+     
+//--- If positions are to be closed after certain holding time in bars
+   if(InpDuration)
+      ExtCloseByTime=true; // Set flag to close upon expiration     
+      
+//--- All checks done
+   return(true);
+  }
+
+//--- Open a position in the direction of the signal
+bool PositionOpen()
+  {
+   ExtSymbolInfo.Refresh();
+   ExtSymbolInfo.RefreshRates();
+
+   double price=0;
+//--- Stop Loss and Take Profit are not set by default
+   double stoploss=0.0;
+   double takeprofit=0.0;
+
+   int    digits=ExtSymbolInfo.Digits();
+   double point=ExtSymbolInfo.Point();
+   double spread=ExtSymbolInfo.Ask()-ExtSymbolInfo.Bid();
+
+//--- Uptrend
+   if(ExtSignalOpen==SIGNAL_BUY)
+     {
+      price=NormalizeDouble(ExtSymbolInfo.Ask(), digits);
+      //--- If Stop Loss is set
+      if(InpSL>0)
+        {
+         stoploss = NormalizeDouble(price-InpSL*point, digits);
+        }
+      //--- If Take Profit is set
+      if(InpTP>0)
+        {
+         takeprofit = NormalizeDouble(price+InpTP*point, digits);
+        }
+
+      if(!ExtTrade.Buy(InpLot, Symbol(), price, stoploss, takeprofit))
+        {
+         PrintFormat("Failed %s buy %G at %G (sl=%G tp=%G) failed. Ask=%G error=%d",
+                     Symbol(), InpLot, price, stoploss, takeprofit, ExtSymbolInfo.Ask(), GetLastError());
+         return(false);
+        }
+     }
+
+//--- Downtrend
+   if(ExtSignalOpen==SIGNAL_SELL)
+     {
+      price=NormalizeDouble(ExtSymbolInfo.Bid(), digits);
+      //--- If Stop Loss is set
+      if(InpSL>0)
+        {
+         stoploss = NormalizeDouble(price+InpSL*point, digits);
+        }
+      //--- If Take Profit is set
+      if(InpTP>0)
+        {
+         takeprofit = NormalizeDouble(price-InpTP*point, digits);
+        }
+
+      if(!ExtTrade.Sell(InpLot, Symbol(), price, stoploss, takeprofit))
+        {
+         PrintFormat("Failed %s sell %G at %G (sl=%G tp=%G) failed. Bid=%G error=%d",
+                     Symbol(), InpLot, price, stoploss, takeprofit, ExtSymbolInfo.Bid(), GetLastError());
+         return(false);
+        }
+     }
+
+//--- OK
+   return(true);
+  }
+
+//--- Close positions by signal
+void CloseBySignal(int type_close)
+  {
+//--- If there is no signal to close, return an error
+   if(!type_close) return;
+
+   double close_price=0.0;
+   double bid, ask;
+   double best_price=0.0;
+   ulong  ticket=0;
+   bool   res=false;
+
+   //--- Close positions with matching type_close
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      ticket=PositionGetTicket(i);
+
+      if(type_close==CLOSE_LONG && PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)
+        {
+         ask=SymbolInfoDouble(Symbol(),SYMBOL_ASK);
+         close_price=ask;
+
+         if(ExtTrade.PositionClose(ticket))
+           {
+            res=true;
+            PrintFormat("Closed long position at %G, ticket %d", close_price, ticket);
+           }
+        }
+
+      if(type_close==CLOSE_SHORT && PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_SELL)
+        {
+         bid=SymbolInfoDouble(Symbol(),SYMBOL_BID);
+         close_price=bid;
+
+         if(ExtTrade.PositionClose(ticket))
+           {
+            res=true;
+            PrintFormat("Closed short position at %G, ticket %d", close_price, ticket);
+           }
+        }
+     }
+
+   if(!res)
+      Print("Failed to close positions, error: ",GetLastError());
+  }
+
+//--- Check for position closing signal
+bool CheckCloseSignal()
+  {
+   ExtSignalClose=SIGNAL_NOT;
+//--- Determine if there is an open position
+   if(PositionExist(SIGNAL_BUY))
+      ExtSignalClose=CLOSE_LONG;
+   if(PositionExist(SIGNAL_SELL))
+      ExtSignalClose=CLOSE_SHORT;
+
+   return(true);
+  }
+
+//--- Check for pattern
+bool CheckPattern()
+  {
+//--- Initialize variables
+   ExtPatternDetected=false; 
+   ExtSignalOpen=SIGNAL_NOT;
+   ExtPatternInfo="";
+
+   double price1_open, price1_close;
+   double price2_open, price2_close;
+   double price3_open, price3_close;
+   double body1, body2, avg_body;
+   double open_high, open_low, price2_high, price2_low;
+   int    digits=(int)SymbolInfoInteger(Symbol(),SYMBOL_DIGITS);
+
+   //--- The last closed candlestick
+   int last_bar=1;
+
+   price1_open  =iOpen(Symbol(),Period(),last_bar);
+   price1_close =iClose(Symbol(),Period(),last_bar);
+   price2_open  =iOpen(Symbol(),Period(),last_bar+1);
+   price2_close =iClose(Symbol(),Period(),last_bar+1);
+   price3_open  =iOpen(Symbol(),Period(),last_bar+2);
+   price3_close =iClose(Symbol(),Period(),last_bar+2);
+   
+   open_high = price1_open>price2_open ? price1_open : price2_open;
+   open_low = price1_open<price2_open ? price1_open : price2_open;
+   price2_high = price2_open>price2_close ? price2_open : price2_close;
+   price2_low = price2_open<price2_close ? price2_open : price2_close;
+
+   body1      =MathAbs(price1_open-price1_close);
+   body2      =MathAbs(price2_open-price2_close);
+   avg_body   =iMA(Symbol(),Period(),ExtAvgBodyPeriod,0,MODE_SMA,PRICE_CLOSE);
+
+   //--- Bullish pattern: Piercing Line
+   if(price2_close<price2_open &&
+      price1_open<price1_close &&
+      price1_open<price2_low && 
+      price1_close>=open_low+0.5*(open_high-open_low) && 
+      body1>=avg_body)
+     {
+      ExtPatternDetected=true;
+      ExtSignalOpen=SIGNAL_BUY;
+      ExtPatternInfo="Piercing Line pattern detected";
+      ExtDirection="Buy";
+     }
+
+   //--- Bearish pattern: Dark Cloud Cover
+   if(price2_close>price2_open &&
+      price1_open>price1_close &&
+      price1_open>price2_high && 
+      price1_close<=open_low+0.5*(open_high-open_low) && 
+      body1>=avg_body)
+     {
+      ExtPatternDetected=true;
+      ExtSignalOpen=SIGNAL_SELL;
+      ExtPatternInfo="Dark Cloud Cover pattern detected";
+      ExtDirection="Sell";
+     }
+   
+   //--- All checks done
+   return(true);
+  }
+
+//--- Check for confirmation using Stochastic Oscillator
+bool CheckConfirmation()
+  {
+   ExtConfirmed=false;
+
+   double stoch_main[], stoch_signal[];
+   ArraySetAsSeries(stoch_main,true);
+   ArraySetAsSeries(stoch_signal,true);
+
+   if(CopyBuffer(ExtIndicatorHandle,0,0,3,stoch_main)<=0 ||
+      CopyBuffer(ExtIndicatorHandle,1,0,3,stoch_signal)<=0)
+     {
+      Print("Error copying stochastic indicator values");
+      return(false);
+     }
+
+   //--- Buy confirmation
+   if(ExtSignalOpen==SIGNAL_BUY)
+     {
+      if(stoch_main[1]>stoch_signal[1] && stoch_main[0]>stoch_signal[0] && stoch_main[1]>=30)
+         ExtConfirmed=true;
+     }
+
+   //--- Sell confirmation
+   if(ExtSignalOpen==SIGNAL_SELL)
+     {
+      if(stoch_main[1]<stoch_signal[1] && stoch_main[0]<stoch_signal[0] && stoch_main[1]<=70)
+         ExtConfirmed=true;
+     }
+
+   return(true);
+  }
+
+//--- Check for existing positions in the direction of the signal
+bool PositionExist(int type_check)
+  {
+   bool res=false;
+
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      if(type_check==SIGNAL_BUY && PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)
+        {
+         res=true;
+         break;
+        }
+
+      if(type_check==SIGNAL_SELL && PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_SELL)
+        {
+         res=true;
+         break;
+        }
+     }
+
+   return(res);
+  }
+
+//--- Check for positions that have expired in terms of time
+bool PositionExpiredByTimeExist()
+  {
+   bool res=false;
+
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      if(PositionGetInteger(POSITION_TIME)<=(TimeCurrent()-(InpDuration*PeriodSeconds(_Period))))
+        {
+         res=true;
+         break;
+        }
+     }
+
+   return(res);
+  }
+  
+//--- Close positions that have expired in terms of time
+void CloseExpiredPositions()
+  {
+   double bid, ask;
+   ulong  ticket=0;
+   bool   res=false;
+
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      ticket=PositionGetTicket(i);
+
+      if(PositionExpiredByTimeExist())
+        {
+         if(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)
+           {
+            ask=SymbolInfoDouble(Symbol(),SYMBOL_ASK);
+
+            if(ExtTrade.PositionClose(ticket))
+              {
+               res=true;
+               PrintFormat("Closed long position due to time expiration at %G, ticket %d", ask, ticket);
+              }
+           }
+         else if(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_SELL)
+           {
+            bid=SymbolInfoDouble(Symbol(),SYMBOL_BID);
+
+            if(ExtTrade.PositionClose(ticket))
+              {
+               res=true;
+               PrintFormat("Closed short position due to time expiration at %G, ticket %d", bid, ticket);
+              }
+           }
+        }
+     }
+
+   if(!res)
+      Print("Failed to close expired positions, error: ",GetLastError());
+  }
+
+//+------------------------------------------------------------------+
+//| Checks position closing time in bars                             |
+//+------------------------------------------------------------------+
+int BarsHold(datetime open_time)
+  {
+//--- first run a basic simple check
+   if(TimeCurrent()-open_time<PeriodSeconds(_Period))
+     {
+      //--- opening time is inside the current bar
+      return(0);
+     }
+//---
+   MqlRates bars[];
+   if(CopyRates(_Symbol, _Period, open_time, TimeCurrent(), bars)==-1)
+     {
+      Print("Error. CopyRates() failed, error = ", GetLastError());
+      return(-1);
+     }
+//--- check position holding time in bars
+   return(ArraySize(bars));
+  }
+//+------------------------------------------------------------------+
+//| Returns the open price of the specified bar                      |
+//+------------------------------------------------------------------+
+double Open(int index)
+  {
+   double val=iOpen(_Symbol, _Period, index);
+//--- if the current check state was successful and an error was received
+   if(ExtCheckPassed && val==0)
+      ExtCheckPassed=false;   // switch the status to failed
+
+   return(val);
+  }
+//+------------------------------------------------------------------+
+//| Returns the close price of the specified bar                     |
+//+------------------------------------------------------------------+
+double Close(int index)
+  {
+   double val=iClose(_Symbol, _Period, index);
+//--- if the current check state was successful and an error was received
+   if(ExtCheckPassed && val==0)
+      ExtCheckPassed=false;   // switch the status to failed
+
+   return(val);
+  }
+//+------------------------------------------------------------------+
+//| Returns the low price of the specified bar                       |
+//+------------------------------------------------------------------+
+double Low(int index)
+  {
+   double val=iLow(_Symbol, _Period, index);
+//--- if the current check state was successful and an error was received
+   if(ExtCheckPassed && val==0)
+      ExtCheckPassed=false;   // switch the status to failed
+
+   return(val);
+  }
+//+------------------------------------------------------------------+
+//| Returns the high price of the specified bar                      |
+//+------------------------------------------------------------------+
+double High(int index)
+  {
+   double val=iHigh(_Symbol, _Period, index);
+//--- if the current check state was successful and an error was received
+   if(ExtCheckPassed && val==0)
+      ExtCheckPassed=false;   // switch the status to failed
+
+   return(val);
+  }
+//+------------------------------------------------------------------+
+//| Returns the middle body price for the specified bar              |
+//+------------------------------------------------------------------+
+double MidPoint(int index)
+  {
+   return(High(index)+Low(index))/2.;
+  }
+//+------------------------------------------------------------------+
+//| Returns the middle price of the range for the specified bar      |
+//+------------------------------------------------------------------+
+double MidOpenClose(int index)
+  {
+   return((Open(index)+Close(index))/2.);
+  }
+//+------------------------------------------------------------------+
+//| Returns the average candlestick body size for the specified bar  |
+//+------------------------------------------------------------------+
+double AvgBody(int index)
+  {
+   double sum=0;
+   for(int i=index; i<index+ExtAvgBodyPeriod; i++)
+     {
+      sum+=MathAbs(Open(i)-Close(i));
+     }
+   return(sum/ExtAvgBodyPeriod);
+  }
+
+//+------------------------------------------------------------------+
+//| Stochastic indicator value at the specified bar                  |
+//+------------------------------------------------------------------+
+double StochSignal(int index)
+  {
+   double indicator_values[];
+   if(CopyBuffer(ExtIndicatorHandle, SIGNAL_LINE, index, 1, indicator_values)<0)
+     {
+      //--- if the copying fails, report the error code
+      PrintFormat("Failed to copy data from the iStochastic indicator, error code %d", GetLastError());
+      return(EMPTY_VALUE);
+     }
+   return(indicator_values[0]);
+  }
+//+------------------------------------------------------------------+
